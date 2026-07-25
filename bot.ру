@@ -1,0 +1,297 @@
+import asyncio
+import os
+import sqlite3
+from datetime import datetime, timedelta
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import CommandStart, Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import ContentType
+from aiogram.client.session.aiohttp import AiohttpSession
+from openai import OpenAI
+
+# ========== ВСТАВЬ СВОИ ДАННЫЕ СЮДА ==========
+BOT_TOKEN = "7690938124:AAFz9Np5Tbgip4xrB9rXmQphRTsqY12sVAw"
+YOOMONEY_WALLET = "4100119581890453"
+YANDEX_API_KEY = "AQVN1Z1ChLUZfSidT2jMM85HHGxtsQN1pwL6WjMv"
+YANDEX_FOLDER_ID = "b1ggtshlgl9dmvbqpui0"
+CHANNEL_ID = -1003869871509
+CHANNEL_LINK = "@Qwertyzat"
+ADMIN_ID = 7135927470
+FREE_DAILY_LIMIT = 25
+SUBSCRIPTION_DAYS = 30
+SUBSCRIPTION_PRICE = 99
+# ============================================
+
+# Настройка клиента — ТОЧНО КАК В ПРИМЕРЕ С САЙТА
+client = OpenAI(
+    api_key=YANDEX_API_KEY,
+    base_url="https://ai.api.cloud.yandex.net/v1",
+    project=YANDEX_FOLDER_ID
+)
+# Модель тоже как в примере — с /latest
+MODEL_NAME = f"gpt://{YANDEX_FOLDER_ID}/deepseek-v4-flash/latest"
+
+if "PYTHONANYWHERE_DOMAIN" in os.environ:
+    session = AiohttpSession(proxy="http://proxy.server:3128")
+else:
+    session = AiohttpSession()
+
+bot = Bot(token=BOT_TOKEN, session=session)
+dp = Dispatcher()
+
+CHANNEL = {"id": CHANNEL_ID, "link": CHANNEL_LINK}
+
+user_history = {}
+MAX_HISTORY_LENGTH = 12
+GREETINGS = {"ало", "привет", "хай", "хелло", "ку", "здравствуй", "здравствуйте"}
+
+class Broadcast(StatesGroup):
+    waiting_for_content = State()
+
+conn = sqlite3.connect("users.db")
+cursor = conn.cursor()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY UNIQUE,
+    username TEXT,
+    first_name TEXT,
+    request_count INTEGER DEFAULT 0,
+    last_request_date TEXT DEFAULT '',
+    subscription_active_until TEXT DEFAULT '',
+    last_payment_label TEXT DEFAULT ''
+)
+""")
+conn.commit()
+
+def get_user_data(user_id: int):
+    row = cursor.execute(
+        "SELECT request_count, last_request_date, subscription_active_until FROM users WHERE user_id = ?",
+        (user_id,)
+    ).fetchone()
+    if not row:
+        return 0, "", ""
+    count, last_date, sub_until = row
+    today = datetime.now().date().isoformat()
+    if last_date != today:
+        cursor.execute(
+            "UPDATE users SET request_count = 0, last_request_date = ? WHERE user_id = ?",
+            (today, user_id)
+        )
+        conn.commit()
+        count = 0
+    return count, today, sub_until
+
+def has_active_subscription(sub_until: str) -> bool:
+    if not sub_until:
+        return False
+    try:
+        return datetime.now().date() <= datetime.fromisoformat(sub_until).date()
+    except:
+        return False
+
+def increment_request_count(user_id: int):
+    today = datetime.now().date().isoformat()
+    cursor.execute(
+        "UPDATE users SET request_count = request_count + 1, last_request_date = ? WHERE user_id = ?",
+        (today, user_id)
+    )
+    conn.commit()
+
+def activate_subscription(user_id: int):
+    new_expiry = (datetime.now() + timedelta(days=SUBSCRIPTION_DAYS)).isoformat()
+    cursor.execute(
+        "UPDATE users SET subscription_active_until = ?, last_payment_label = '' WHERE user_id = ?",
+        (new_expiry, user_id)
+    )
+    conn.commit()
+
+def save_payment_label(user_id: int, label: str):
+    cursor.execute(
+        "UPDATE users SET last_payment_label = ? WHERE user_id = ?",
+        (label, user_id)
+    )
+    conn.commit()
+
+async def check_subscription(user_id: int) -> dict:
+    try:
+        ch = await bot.get_chat(CHANNEL["id"])
+        member = await bot.get_chat_member(ch.id, user_id)
+        return {"ok": True, "is_subscribed": member.status not in ("left", "kicked"), "link": CHANNEL["link"]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def save_user(user_id: int, username: str, first_name: str):
+    cursor.execute(
+        "INSERT OR IGNORE INTO users (user_id, username, first_name, request_count, last_request_date, subscription_active_until) "
+        "VALUES (?, ?, ?, 0, ?, '')",
+        (user_id, username or "", first_name, datetime.now().date().isoformat())
+    )
+    conn.commit()
+
+# Новая функция запроса — через OpenAI клиент
+async def get_ai_answer(messages: list) -> str:
+    openai_messages = []
+    for msg in messages:
+        openai_messages.append({"role": msg["role"], "content": msg["text"]})
+    
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=openai_messages,
+        temperature=0.8,
+        max_tokens=2048
+    )
+    return response.choices[0].message.content.strip()
+
+def generate_payment_link(user_id: int) -> tuple[str, str]:
+    label = f"sub_{user_id}_{int(datetime.now().timestamp())}"
+    link = f"https://yoomoney.ru/quickpay/confirm.xml?receiver={YOOMONEY_WALLET}&quickpay-form=button&paymentType=AC&sum={SUBSCRIPTION_PRICE}&label={label}"
+    return link, label
+
+@dp.message(CommandStart())
+async def start_h(message: types.Message):
+    save_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    user_history[message.from_user.id] = []
+    sub = await check_subscription(message.from_user.id)
+    if not sub["ok"]:
+        await message.answer(f"⚠️ Ошибка канала: {sub['error']}")
+        return
+    if sub["is_subscribed"]:
+        _, _, sub_until = get_user_data(message.from_user.id)
+        active = has_active_subscription(sub_until)
+        txt = "💎 Подписка активна, запросы безлимитные!" if active else f"🆓 Осталось {FREE_DAILY_LIMIT} бесплатных запросов сегодня"
+        await message.answer(f"👋 Привет!\n{txt}\n\nДоступные команды:\n/subscribe — оплата\n/check_payment — подтвердить оплату\n/status — статус\n/clear — сброс диалога")
+    else:
+        await message.answer(f"🔒 Сначала подпишись на канал: {CHANNEL_LINK}")
+
+@dp.message(Command("clear"))
+async def clear_h(message: types.Message):
+    user_history.pop(message.from_user.id, None)
+    await message.answer("🧹 История диалога очищена")
+
+@dp.message(Command("status"))
+async def status_h(message: types.Message):
+    cnt, _, sub_until = get_user_data(message.from_user.id)
+    if has_active_subscription(sub_until):
+        await message.answer(f"💎 Подписка до {datetime.fromisoformat(sub_until).strftime('%d.%m.%Y')}\nЗапросы безлимитные")
+    else:
+        await message.answer(f"🆓 Бесплатных запросов сегодня: {FREE_DAILY_LIMIT - cnt} из {FREE_DAILY_LIMIT}")
+
+@dp.message(Command("subscribe"))
+async def subscribe_h(message: types.Message):
+    if not (await check_subscription(message.from_user.id))["is_subscribed"]:
+        await message.answer(f"🔒 Сначала подпишись: {CHANNEL_LINK}")
+        return
+    _, _, sub_until = get_user_data(message.from_user.id)
+    if has_active_subscription(sub_until):
+        await message.answer(f"✅ Подписка уже активна до {datetime.fromisoformat(sub_until).strftime('%d.%m.%Y')}")
+        return
+    link, label = generate_payment_link(message.from_user.id)
+    save_payment_label(message.from_user.id, label)
+    await message.answer(f"💎 Подписка на {SUBSCRIPTION_DAYS} дней — {SUBSCRIPTION_PRICE} ₽\nОплата: {link}\nПосле оплаты нажми /check_payment")
+
+@dp.message(Command("check_payment"))
+async def check_h(message: types.Message):
+    uid = message.from_user.id
+    row = cursor.execute("SELECT last_payment_label FROM users WHERE user_id = ?", (uid,)).fetchone()
+    if not row or not row[0]:
+        await message.answer("⚠️ Сначала нажми /subscribe")
+        return
+    lbl = row[0]
+    info = f"🔔 Оплата от ID {uid}\n@{message.from_user.username or '—'} {message.from_user.first_name}\nМетка: `{lbl}`"
+    await bot.send_message(ADMIN_ID, f"{info}\nПроверь и активируй: /activate_sub {uid}")
+    await message.answer("✅ Запрос отправлен админу, ожидай подтверждения")
+
+@dp.message(Command("activate_sub"))
+async def activate_h(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ Нет прав")
+        return
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("⚠️ /activate_sub ID_пользователя")
+        return
+    uid = int(parts[1])
+    if not cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (uid,)).fetchone():
+        await message.answer("❌ Пользователь не найден")
+        return
+    activate_subscription(uid)
+    exp = datetime.fromisoformat(cursor.execute("SELECT subscription_active_until FROM users WHERE user_id = ?", (uid,)).fetchone()[0]).strftime("%d.%m.%Y")
+    try:
+        await bot.send_message(uid, f"✅ Оплата подтверждена!\n💎 Подписка до {exp}")
+    except:
+        pass
+    await message.answer(f"✅ Подписка для {uid} до {exp}")
+
+@dp.message(Command("send_ad"))
+async def ad_start(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ Нет прав")
+        return
+    await state.set_state(Broadcast.waiting_for_content)
+    await message.answer("📢 Пришли текст/фото/видео для рассылки\n/cancel — отмена")
+
+@dp.message(Command("cancel"), StateFilter(Broadcast.waiting_for_content))
+async def ad_cancel(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ Отменено")
+
+@dp.message(StateFilter(Broadcast.waiting_for_content))
+async def ad_send(message: types.Message, state: FSMContext):
+    await state.clear()
+    uids = [r[0] for r in cursor.execute("SELECT user_id FROM users").fetchall()]
+    if ADMIN_ID not in uids:
+        uids.append(ADMIN_ID)
+    ok = 0
+    for uid in uids:
+        try:
+            if message.photo:
+                await bot.send_photo(uid, message.photo[-1].file_id, caption=message.caption)
+            elif message.video:
+                await bot.send_video(uid, message.video.file_id, caption=message.caption)
+            elif message.document:
+                await bot.send_document(uid, message.document.file_id, caption=message.caption)
+            else:
+                await bot.send_message(uid, message.text)
+            ok += 1
+            await asyncio.sleep(0.05)
+        except:
+            pass
+    await message.answer(f"✅ Разослано: {ok} из {len(uids)}")
+
+@dp.message(StateFilter(None), lambda m: not m.text.startswith("/"))
+async def talk(message: types.Message):
+    uid = message.from_user.id
+    if not (await check_subscription(uid))["is_subscribed"]:
+        await message.answer(f"🔒 Подпишись: {CHANNEL_LINK}")
+        return
+    cnt, _, sub_until = get_user_data(uid)
+    if not has_active_subscription(sub_until) and cnt >= FREE_DAILY_LIMIT:
+        await message.answer(f"⚠️ Лимит {FREE_DAILY_LIMIT} запросов исчерпан\n💎 /subscribe для безлимита")
+        return
+    if uid not in user_history:
+        user_history[uid] = []
+    if message.text.lower() in GREETINGS:
+        await message.answer("👋 Привет! Чем могу помочь?")
+        return
+    user_history[uid].append({"role": "user", "text": message.text})
+    if len(user_history[uid]) > MAX_HISTORY_LENGTH:
+        user_history[uid] = user_history[uid][-MAX_HISTORY_LENGTH:]
+    msgs = [{"role": "system", "text": "Отвечай понятно, структурированно, учитывай историю диалога."}] + user_history[uid]
+    try:
+        await bot.send_chat_action(message.chat.id, "typing")
+        ans = await get_ai_answer(msgs)
+        user_history[uid].append({"role": "assistant", "text": ans})
+        if not has_active_subscription(sub_until):
+            increment_request_count(uid)
+        await message.answer(ans, parse_mode="Markdown")
+    except Exception as e:
+        await message.answer(f"⚠️ Ошибка: {e}")
+
+async def main():
+    print("✅ Бот запущен!")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
