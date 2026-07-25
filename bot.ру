@@ -11,18 +11,17 @@ from aiogram.types import ContentType
 from aiogram.client.session.aiohttp import AiohttpSession
 from openai import OpenAI
 
-# ========== ВСТАВЬ СВОИ ДАННЫЕ СЮДА ==========
-BOT_TOKEN = "7690938124:AAFz9Np5Tbgip4xrB9rXmQphRTsqY12sVAw"
-YOOMONEY_WALLET = "4100119581890453"
-YANDEX_API_KEY = "AQVN1Z1ChLUZfSidT2jMM85HHGxtsQN1pwL6WjMv"
-YANDEX_FOLDER_ID = "b1ggtshlgl9dmvbqpui0"
-CHANNEL_ID = -1003869871509
-CHANNEL_LINK = "@Qwertyzat"
-ADMIN_ID = 7135927470
-FREE_DAILY_LIMIT = 25
-SUBSCRIPTION_DAYS = 30
-SUBSCRIPTION_PRICE = 99
-# ============================================
+# Секреты теперь хранятся в переменных окружения, а не в коде
+BOT_TOKEN = os.getenv("7690938124:AAFz9Np5Tbgip4xrB9rXmQphRTsqY12sVAw")
+YOOMONEY_WALLET = os.getenv("4100119581890453")
+YANDEX_API_KEY = os.getenv("AQVN1Z1ChLUZfSidT2jMM85HHGxtsQN1pwL6WjMv")
+YANDEX_FOLDER_ID = os.getenv("b1ggtshlgl9dmvbqpui0")
+CHANNEL_ID = int(os.getenv("-1003869871509"))
+CHANNEL_LINK = os.getenv("@Qwertyzat")
+ADMIN_ID = int(os.getenv("7135927470"))
+FREE_DAILY_LIMIT = int(os.getenv("FREE_DAILY_LIMIT", 25))
+SUBSCRIPTION_DAYS = int(os.getenv("SUBSCRIPTION_DAYS", 30))
+SUBSCRIPTION_PRICE = int(os.getenv("SUBSCRIPTION_PRICE", 99))
 
 # Настройка клиента — ТОЧНО КАК В ПРИМЕРЕ С САЙТА
 client = OpenAI(
